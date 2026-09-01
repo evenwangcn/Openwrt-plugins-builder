@@ -54,6 +54,7 @@ jobs:
           fi
 
           echo "LATEST_TAG=${latest_tag}" >> "${GITHUB_ENV}"
+          echo "RELEASE_TAG=mosdns-${latest_tag}-openwrt-${OPENWRT_VERSION}" >> "${GITHUB_ENV}"
           echo "tag=${latest_tag}" >> "${GITHUB_OUTPUT}"
           echo "Latest MosDNS release: ${latest_tag}"
 
@@ -207,8 +208,9 @@ jobs:
       - name: Upload run files as release assets
         uses: softprops/action-gh-release@v2.1.0
         with:
-          tag_name: ${{ env.LATEST_TAG }}
-          name: mosdns-${{ env.LATEST_TAG }}-openwrt-${{ env.OPENWRT_VERSION }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: MosDNS ${{ env.LATEST_TAG }} - OpenWrt ${{ env.OPENWRT_VERSION }}
+          target_commitish: ${{ github.sha }}
           files: makeself/mosdns_*.run
           body_path: release-notes.md
           fail_on_unmatched_files: true
