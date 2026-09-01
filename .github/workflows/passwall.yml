@@ -1,0 +1,199 @@
+name: Make PassWall run files
+
+on:
+  workflow_dispatch:
+    inputs:
+      openwrt_version:
+        description: OpenWrt / ImmortalWrt version
+        required: true
+        type: choice
+        default: "24.10"
+        options:
+          - "25.12"
+          - "24.10"
+          - "23.05"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: passwall-run-${{ inputs.openwrt_version }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    env:
+      OPENWRT_VERSION: ${{ inputs.openwrt_version }}
+      PASSWALL_REPO: Openwrt-Passwall/openwrt-passwall
+      KENZOK8_REPO: kenzok8/small
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y jq unzip
+
+      - name: Resolve upstream releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          passwall_json="$(gh api "repos/${PASSWALL_REPO}/releases/latest")"
+          passwall_tag="$(jq -er '.tag_name' <<<"$passwall_json")"
+
+          # kenzok8 的 tag 格式类似：89-x86_64-24.10.5。
+          # 用户只选择 24.10 这类大版本；这里自动选择相应架构下
+          # 发布时间最新的 24.10.x Release。
+          releases="$(gh api --paginate "repos/${KENZOK8_REPO}/releases?per_page=100" --slurp)"
+          for arch in x86_64 aarch64_cortex-a53; do
+            tag="$(jq -er --arg marker "-${arch}-${OPENWRT_VERSION}." \
+              '[.[][] | select(.draft == false and (.tag_name | contains($marker)))]
+               | sort_by(.published_at) | reverse | .[0].tag_name' <<<"$releases")"
+            printf 'KENZOK8_TAG_%s=%s\n' "${arch//-/_}" "$tag" >> "$GITHUB_ENV"
+          done
+
+          echo "PASSWALL_TAG=$passwall_tag" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=passwall-${passwall_tag}-openwrt-${OPENWRT_VERSION}" >> "$GITHUB_ENV"
+          if [[ "$OPENWRT_VERSION" == "25.12" ]]; then
+            echo "PACKAGE_FORMAT=apk" >> "$GITHUB_ENV"
+          else
+            echo "PACKAGE_FORMAT=ipk" >> "$GITHUB_ENV"
+          fi
+
+      - name: Clone makeself
+        run: git clone --depth 1 https://github.com/megastep/makeself.git
+
+      - name: Download PassWall LuCI packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p downloads/main
+
+          if [[ "$PACKAGE_FORMAT" == apk ]]; then
+            gh release download "$PASSWALL_TAG" \
+              --repo "$PASSWALL_REPO" \
+              --dir downloads/main \
+              --pattern '25.12+_luci-app-passwall-*.apk' \
+              --pattern '25.12+_luci-i18n-passwall-zh-cn-*.apk'
+          else
+            # OpenWrt 23.05 和 24.10 共用上游的 23.05-24.10 IPK。
+            gh release download "$PASSWALL_TAG" \
+              --repo "$PASSWALL_REPO" \
+              --dir downloads/main \
+              --pattern '23.05-24.10_luci-app-passwall_*_all.ipk' \
+              --pattern '23.05-24.10_luci-i18n-passwall-zh-cn_*_all.ipk'
+          fi
+
+          test "$(find downloads/main -maxdepth 1 -name "*.${PACKAGE_FORMAT}" | wc -l)" -eq 2
+
+      - name: Download dependencies from kenzok8
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          download_dependencies() {
+            arch="$1"
+            tag="$2"
+            dest="downloads/depends/${arch}"
+            mkdir -p "$dest"
+
+            # small 的 Release 还含 SSR/PassWall2 等 LuCI 插件；run 包只收录
+            # PassWall 可使用的运行组件，避免把其他管理插件一起装进路由器。
+            gh api "repos/${KENZOK8_REPO}/releases/tags/${tag}" --paginate \
+              --jq '.assets[].browser_download_url' |
+              grep -E "/(brook|chinadns-ng|dns2socks|geoview|haproxy|hysteria|ipt2socks|microsocks|naiveproxy|shadowsocks-libev|shadowsocks-rust|shadowsocksr-libev|simple-obfs|sing-box|tcping|trojan-plus|tuic-client|v2ray-geoip|v2ray-geosite|v2ray-plugin|xray-core|xray-plugin|shadow-tls)[^/]*\\.${PACKAGE_FORMAT}$" |
+              grep -Ev "/sing-box-tiny[^/]*\\.${PACKAGE_FORMAT}$" |
+              while IFS= read -r url; do
+                curl --fail --location --retry 3 \
+                  -H "Authorization: Bearer ${GH_TOKEN}" \
+                  -H 'Accept: application/octet-stream' \
+                  --output "$dest/$(basename "$url")" "$url"
+              done
+
+            test -n "$(find "$dest" -maxdepth 1 -name "*.${PACKAGE_FORMAT}" -print -quit)"
+          }
+
+          download_dependencies x86_64 "$KENZOK8_TAG_x86_64"
+          download_dependencies aarch64_cortex-a53 "$KENZOK8_TAG_aarch64_cortex_a53"
+
+      - name: Assemble package directories
+        run: |
+          set -euo pipefail
+          for arch in x86_64 aarch64_cortex-a53; do
+            package_dir="passwall_${arch}"
+            mkdir -p "$package_dir/depends" "$package_dir/main"
+            cp downloads/depends/"$arch"/*."$PACKAGE_FORMAT" "$package_dir/depends/"
+            cp downloads/main/*."$PACKAGE_FORMAT" "$package_dir/main/"
+
+            # sing-box 和 sing-box-tiny 提供相同的二进制及 init 脚本，不能共存。
+            # PassWall 使用完整版 sing-box；这里再做一次防御性清理。
+            find "$package_dir/depends" -maxdepth 1 \
+              -type f -name "sing-box-tiny*.${PACKAGE_FORMAT}" -delete
+            test -n "$(find "$package_dir/depends" -maxdepth 1 \
+              -type f -name "sing-box*.${PACKAGE_FORMAT}" \
+              ! -name "sing-box-tiny*.${PACKAGE_FORMAT}" -print -quit)"
+
+            cat > "$package_dir/install.sh" <<'INSTALL_SCRIPT'
+          #!/bin/sh
+          set -e
+          cd "$(dirname "$0")"
+
+          if command -v apk >/dev/null 2>&1; then
+              apk update
+              apk add --allow-untrusted depends/*.apk
+              apk add --allow-untrusted main/*.apk
+          elif command -v opkg >/dev/null 2>&1; then
+              opkg update
+              opkg install iptables-mod-tproxy iptables-mod-socket \
+                iptables-mod-iprange iptables-mod-conntrack-extra
+              opkg install depends/*.ipk
+              opkg install main/*.ipk
+          else
+              echo "Error: neither apk nor opkg was found."
+              exit 1
+          fi
+          /etc/init.d/rpcd restart 2>/dev/null || true
+          /etc/init.d/uhttpd restart 2>/dev/null || true
+          INSTALL_SCRIPT
+            chmod +x "$package_dir/install.sh"
+          done
+
+      - name: Create self-extracting packages
+        run: |
+          set -euo pipefail
+          ./makeself/makeself.sh passwall_x86_64 \
+            "passwall_x86_64_openwrt-${OPENWRT_VERSION}_${PASSWALL_TAG}.run" \
+            "PassWall ${PASSWALL_TAG} for OpenWrt ${OPENWRT_VERSION} x86_64" \
+            ./install.sh
+          ./makeself/makeself.sh passwall_aarch64_cortex-a53 \
+            "passwall_aarch64_cortex-a53_openwrt-${OPENWRT_VERSION}_${PASSWALL_TAG}.run" \
+            "PassWall ${PASSWALL_TAG} for OpenWrt ${OPENWRT_VERSION} aarch64_cortex-a53" \
+            ./install.sh
+          ls -lh passwall_*.run
+
+      - name: Create release notes
+        run: |
+          cat > release_notes.md <<EOF
+          PassWall: ${PASSWALL_TAG}
+
+          OpenWrt / ImmortalWrt: ${OPENWRT_VERSION}
+
+          Dependencies:
+          - x86_64: kenzok8/small ${KENZOK8_TAG_x86_64}
+          - aarch64_cortex-a53: kenzok8/small ${KENZOK8_TAG_aarch64_cortex_a53}
+          EOF
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: PassWall ${{ env.PASSWALL_TAG }} - OpenWrt ${{ env.OPENWRT_VERSION }}
+          target_commitish: ${{ github.sha }}
+          body_path: release_notes.md
+          files: passwall_*.run
+          fail_on_unmatched_files: true
