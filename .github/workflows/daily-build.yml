@@ -1,0 +1,50 @@
+name: Daily plugin builds
+
+on:
+  schedule:
+    # GitHub Actions cron uses UTC. 02:00 UTC = 08:00 Asia/Shanghai.
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+
+    steps:
+      - name: Trigger all MosDNS builds
+        run: |
+          set -euo pipefail
+          for version in 24.10 25.12; do
+            echo "Triggering MosDNS for OpenWrt ${version}..."
+            gh workflow run mosdns.yml \
+              --repo "${GH_REPO}" \
+              --ref "${GITHUB_REF_NAME}" \
+              -f "openwrt_version=${version}"
+          done
+
+      - name: Trigger all PassWall builds
+        run: |
+          set -euo pipefail
+          for version in 24.10 25.12; do
+            echo "Triggering PassWall for OpenWrt ${version}..."
+            gh workflow run passwall.yml \
+              --repo "${GH_REPO}" \
+              --ref "${GITHUB_REF_NAME}" \
+              -f "openwrt_version=${version}"
+          done
+
+      - name: Summary
+        run: |
+          {
+            echo "## Build workflows dispatched"
+            echo
+            echo "- MosDNS: OpenWrt 24.10 and 25.12"
+            echo "- PassWall: OpenWrt 24.10 and 25.12"
+          } >> "${GITHUB_STEP_SUMMARY}"
