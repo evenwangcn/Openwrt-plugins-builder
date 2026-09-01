@@ -29,7 +29,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y jq unzip
@@ -188,7 +188,7 @@ jobs:
           EOF
 
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           name: PassWall ${{ env.PASSWALL_TAG }} - OpenWrt ${{ env.OPENWRT_VERSION }}
