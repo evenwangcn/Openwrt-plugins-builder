@@ -2,8 +2,8 @@ name: Daily plugin builds
 
 on:
   schedule:
-    # GitHub Actions cron uses UTC. 02:00 UTC = 08:00 Asia/Shanghai.
-    - cron: "0 0 * * *"
+    # GitHub Actions cron uses UTC. 02:00 UTC = 12:00 Asia/Shanghai.
+    - cron: "0 4 * * *"
   workflow_dispatch:
 
 permissions:
