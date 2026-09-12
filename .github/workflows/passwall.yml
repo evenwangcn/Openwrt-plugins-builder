@@ -122,8 +122,32 @@ jobs:
             if ! find "$dest" -maxdepth 1 -type f \
               \( -name "xray-core[-_]*.${PACKAGE_FORMAT}" \
                  -o -name "xray[-_][0-9]*.${PACKAGE_FORMAT}" \) -print -quit | grep -q .; then
-              echo "::error::Missing Xray core for ${arch}, release ${tag}. Check upstream assets (xray-core or xray)."
-              exit 1
+              echo "Xray core absent from ${tag}; fetching the matching OpenWrt package."
+              local stable_version index_url core_name
+              stable_version="$(curl --fail --silent --show-error --location --retry 3 \
+                https://downloads.openwrt.org/releases/ |
+                grep -oE 'href="[0-9]+\.[0-9]+\.[0-9]+/"' |
+                cut -d '"' -f 2 | tr -d '/' |
+                awk -v prefix="${OPENWRT_VERSION}." 'index($0, prefix) == 1' |
+                sort -V | tail -n 1)"
+              if [[ -z "$stable_version" ]]; then
+                echo "::error::No stable OpenWrt release found for ${OPENWRT_VERSION}"
+                exit 1
+              fi
+              index_url="https://downloads.openwrt.org/releases/${stable_version}/packages/${arch}/packages"
+              core_name="$(curl --fail --silent --show-error --location --retry 3 "${index_url}/" |
+                grep -oE 'href="xray-core[-_][^"]+"' |
+                cut -d '"' -f 2 |
+                grep -E "\\.${PACKAGE_FORMAT}$")"
+              if [[ -z "$core_name" || "$core_name" == *$'\n'* || "$core_name" == */* ]]; then
+                echo "::error::Expected one Xray core package at ${index_url}/"
+                exit 1
+              fi
+              echo "Downloading ${index_url}/${core_name}"
+              curl --fail --silent --show-error --location --retry 3 \
+                --output "$dest/$core_name" "${index_url}/${core_name}"
+              test -s "$dest/$core_name"
+              printf '%s: %s/%s\n' "$arch" "$index_url" "$core_name" >> downloads/xray-sources.txt
             fi
           }
 
@@ -203,6 +227,10 @@ jobs:
           - aarch64_cortex-a53: kenzok8/small ${KENZOK8_TAG_aarch64_cortex_a53}
           - aarch64_generic: kenzok8/small ${KENZOK8_TAG_aarch64_generic}
           EOF
+          if [ -f downloads/xray-sources.txt ]; then
+            printf '\nXray core fallback sources:\n' >> release_notes.md
+            cat downloads/xray-sources.txt >> release_notes.md
+          fi
 
       - name: Publish release
         uses: softprops/action-gh-release@v3
