@@ -135,6 +135,7 @@ jobs:
 
           # Install local packages in the dependency order used by the upstream installer.
           for pattern in \
+            "./geo2txt*.$package_extension" \
             "./v2dat*.$package_extension" \
             "./v2ray-geoip*.$package_extension" \
             "./v2ray-geosite*.$package_extension" \
