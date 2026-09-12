@@ -102,12 +102,13 @@ jobs:
 
           download_packages "x86_64" "mosdns_x86_64"
           download_packages "aarch64_cortex-a53" "mosdns_aarch64_cortex-a53"
+          download_packages "aarch64_generic" "mosdns_aarch64_generic"
 
       - name: Create install scripts
         run: |
           set -euo pipefail
 
-          for package_dir in mosdns_x86_64 mosdns_aarch64_cortex-a53; do
+          for package_dir in mosdns_x86_64 mosdns_aarch64_cortex-a53 mosdns_aarch64_generic; do
             cat > "${package_dir}/install.sh" <<'INSTALL_SCRIPT'
           #!/bin/sh
           set -eu
@@ -168,6 +169,7 @@ jobs:
 
           mv mosdns_x86_64 makeself/
           mv mosdns_aarch64_cortex-a53 makeself/
+          mv mosdns_aarch64_generic makeself/
 
           cd makeself
           ./makeself.sh \
@@ -182,11 +184,17 @@ jobs:
             "MosDNS ${LATEST_TAG} for OpenWrt ${OPENWRT_VERSION} aarch64_cortex-a53" \
             ./install.sh
 
+          ./makeself.sh \
+            mosdns_aarch64_generic/ \
+            "mosdns_${LATEST_TAG}_openwrt-${OPENWRT_VERSION}_aarch64_generic.run" \
+            "MosDNS ${LATEST_TAG} for OpenWrt ${OPENWRT_VERSION} aarch64_generic" \
+            ./install.sh
+
       - name: Verify run files
         run: |
           set -euo pipefail
           ls -lh makeself/mosdns_*.run
-          test "$(find makeself -maxdepth 1 -type f -name 'mosdns_*.run' | wc -l)" -eq 2
+          test "$(find makeself -maxdepth 1 -type f -name 'mosdns_*.run' | wc -l)" -eq 3
 
       - name: Create release notes
         run: |
@@ -196,6 +204,7 @@ jobs:
           Included architectures:
           - x86_64
           - aarch64_cortex-a53
+          - aarch64_generic
 
           Run the matching installer on the OpenWrt device as root.
           EOF
