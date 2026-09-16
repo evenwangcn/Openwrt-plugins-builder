@@ -41,9 +41,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          # GitHub latest 仅选正式发布；额外检查，禁止混入预发布版。
-          xray_json="$(gh api "repos/${XRAY_REPO}/releases/latest")"
-          xray_tag="$(jq -er 'select(.draft == false and .prerelease == false) | .tag_name' <<<"$xray_json")"
+          # 包含预发布版，按发布时间选择最新的非草稿 Release。
+          # /releases/latest 仅返回正式版，因此使用完整发布列表。
+          xray_releases="$(gh api --paginate "repos/${XRAY_REPO}/releases?per_page=100" --slurp)"
+          xray_json="$(jq -ec '[.[][] | select(.draft == false and .published_at != null)]
+            | max_by(.published_at) // error("No published Xray release found")' <<<"$xray_releases")"
+          xray_tag="$(jq -er '.tag_name' <<<"$xray_json")"
           [[ "$xray_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           echo "XRAY_TAG=$xray_tag" >> "$GITHUB_ENV"
           mkdir -p downloads/xray
@@ -164,7 +167,7 @@ jobs:
           download_dependencies aarch64_cortex-a53 "$KENZOK8_TAG_aarch64_cortex_a53"
           download_dependencies aarch64_generic "$KENZOK8_TAG_aarch64_generic"
 
-      - name: Download and verify official stable Xray
+      - name: Download and verify latest published Xray
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -287,7 +290,7 @@ jobs:
           cat > release_notes.md <<EOF
           PassWall: ${PASSWALL_TAG}
 
-          Xray core: ${XRAY_TAG} (official stable release)
+          Xray core: ${XRAY_TAG} (latest published release, including prereleases)
           Source: https://github.com/${XRAY_REPO}/releases/tag/${XRAY_TAG}
           The installer replaces /usr/bin/xray after installing IPK/APK dependencies.
           Package-manager metadata retains the dependency package version; use xray version to check the actual core.
@@ -301,7 +304,7 @@ jobs:
           - aarch64_generic: kenzok8/small ${KENZOK8_TAG_aarch64_generic}
           EOF
           if [ -f downloads/xray-sources.txt ]; then
-            printf '\nXray dependency package fallback sources (binary replaced with official stable):\n' >> release_notes.md
+            printf '\nXray dependency package fallback sources (binary replaced with latest published Xray):\n' >> release_notes.md
             cat downloads/xray-sources.txt >> release_notes.md
           fi
 
@@ -309,7 +312,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
-          name: PassWall ${{ env.PASSWALL_TAG }} - OpenWrt ${{ env.OPENWRT_VERSION }} - Xray ${{ env.XRAY_TAG }}
+          name: PassWall ${{ env.PASSWALL_TAG }} - OpenWrt ${{ env.OPENWRT_VERSION }}
           target_commitish: ${{ github.sha }}
           body_path: release_notes.md
           files: passwall_*.run
