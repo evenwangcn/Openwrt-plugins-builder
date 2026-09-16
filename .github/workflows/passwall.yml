@@ -26,19 +26,28 @@ jobs:
       OPENWRT_VERSION: ${{ inputs.openwrt_version }}
       PASSWALL_REPO: Openwrt-Passwall/openwrt-passwall
       KENZOK8_REPO: kenzok8/small
+      XRAY_REPO: XTLS/Xray-core
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
 
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y jq unzip
+        run: sudo apt-get update && sudo apt-get install -y jq unzip qemu-user
 
       - name: Resolve upstream releases
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+
+          # GitHub latest 仅选正式发布；额外检查，禁止混入预发布版。
+          xray_json="$(gh api "repos/${XRAY_REPO}/releases/latest")"
+          xray_tag="$(jq -er 'select(.draft == false and .prerelease == false) | .tag_name' <<<"$xray_json")"
+          [[ "$xray_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          echo "XRAY_TAG=$xray_tag" >> "$GITHUB_ENV"
+          mkdir -p downloads/xray
+          printf '%s\n' "$xray_json" > downloads/xray/release.json
 
           passwall_json="$(gh api "repos/${PASSWALL_REPO}/releases/latest")"
           passwall_tag="$(jq -er '.tag_name' <<<"$passwall_json")"
@@ -55,7 +64,7 @@ jobs:
           done
 
           echo "PASSWALL_TAG=$passwall_tag" >> "$GITHUB_ENV"
-          echo "RELEASE_TAG=passwall-${passwall_tag}-openwrt-${OPENWRT_VERSION}" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=passwall-${passwall_tag}-openwrt-${OPENWRT_VERSION}-xray-${xray_tag}" >> "$GITHUB_ENV"
           if [[ "$OPENWRT_VERSION" == "25.12" ]]; then
             echo "PACKAGE_FORMAT=apk" >> "$GITHUB_ENV"
           else
@@ -155,12 +164,52 @@ jobs:
           download_dependencies aarch64_cortex-a53 "$KENZOK8_TAG_aarch64_cortex_a53"
           download_dependencies aarch64_generic "$KENZOK8_TAG_aarch64_generic"
 
+      - name: Download and verify official stable Xray
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for target in 64 arm64-v8a; do
+            asset="Xray-linux-${target}.zip"
+            dest="downloads/xray/${target}"
+            mkdir -p "$dest"
+            gh release download "$XRAY_TAG" --repo "$XRAY_REPO" \
+              --dir "$dest" --pattern "$asset" --pattern "${asset}.dgst"
+            # 官方 .dgst 使用 OpenSSL 格式：SHA2-256= ... 或 SHA256= ...。
+            digest="$(awk -F= 'toupper($1) ~ /^SHA(2-)?256[[:space:]]*$/ {
+              gsub(/[[:space:]]/, "", $2); print tolower($2)
+            }' "$dest/${asset}.dgst")"
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+            (cd "$dest" && printf '%s  %s\n' "$digest" "$asset" | sha256sum -c -)
+            unzip -j "$dest/$asset" xray LICENSE -d "$dest"
+            chmod +x "$dest/xray"
+            if [[ "$target" == 64 ]]; then
+              actual="$("$dest/xray" version)"
+            else
+              actual="$(qemu-aarch64 "$dest/xray" version)"
+            fi
+            version="$(awk 'NR == 1 && $1 == "Xray" { print $2 }' <<<"$actual")"
+            if [[ "$version" != "${XRAY_TAG#v}" ]]; then
+              echo "::error::Xray ${target}: expected ${XRAY_TAG#v}, got $version"
+              exit 1
+            fi
+            printf '%s\n' "${XRAY_TAG#v}" > "$dest/version"
+            (cd "$dest" && sha256sum xray > SHA256SUMS)
+          done
+
       - name: Assemble package directories
         run: |
           set -euo pipefail
           for arch in x86_64 aarch64_cortex-a53 aarch64_generic; do
             package_dir="passwall_${arch}"
-            mkdir -p "$package_dir/depends" "$package_dir/main"
+            mkdir -p "$package_dir/depends" "$package_dir/main" "$package_dir/xray"
+            case "$arch" in
+              x86_64) xray_target=64 ;;
+              aarch64_cortex-a53|aarch64_generic) xray_target=arm64-v8a ;;
+              *) exit 1 ;;
+            esac
+            cp downloads/xray/"$xray_target"/{xray,LICENSE,version,SHA256SUMS} "$package_dir/xray/"
+            (cd "$package_dir/xray" && sha256sum -c SHA256SUMS)
             cp downloads/depends/"$arch"/*."$PACKAGE_FORMAT" "$package_dir/depends/"
             cp downloads/main/*."$PACKAGE_FORMAT" "$package_dir/main/"
 
@@ -177,6 +226,13 @@ jobs:
           set -e
           cd "$(dirname "$0")"
 
+          # 安装任何软件包前先验证随包核心能在目标设备运行。
+          (cd xray && sha256sum -c SHA256SUMS)
+          expected="$(cat xray/version)"
+          actual="$(./xray/xray version)"
+          actual="$(printf '%s\n' "$actual" | awk 'NR == 1 && $1 == "Xray" {print $2}')"
+          [ "$actual" = "$expected" ] || { echo "Xray version mismatch"; exit 1; }
+
           if command -v apk >/dev/null 2>&1; then
               apk update
               apk add --allow-untrusted depends/*.apk
@@ -190,6 +246,17 @@ jobs:
           else
               echo "Error: neither apk nor opkg was found."
               exit 1
+          fi
+          # 最后替换，避免依赖安装将官方核心覆盖。包元数据保留源包版本。
+          tmp_xray="$(mktemp /usr/bin/.xray.XXXXXX)"
+          trap 'rm -f "$tmp_xray"' EXIT HUP INT TERM
+          cp ./xray/xray "$tmp_xray"
+          chmod 755 "$tmp_xray"
+          mv -f "$tmp_xray" /usr/bin/xray
+          trap - EXIT HUP INT TERM
+          /usr/bin/xray version
+          if [ -x /etc/init.d/passwall ]; then
+              /etc/init.d/passwall restart
           fi
           /etc/init.d/rpcd restart 2>/dev/null || true
           /etc/init.d/uhttpd restart 2>/dev/null || true
@@ -220,6 +287,12 @@ jobs:
           cat > release_notes.md <<EOF
           PassWall: ${PASSWALL_TAG}
 
+          Xray core: ${XRAY_TAG} (official stable release)
+          Source: https://github.com/${XRAY_REPO}/releases/tag/${XRAY_TAG}
+          The installer replaces /usr/bin/xray after installing IPK/APK dependencies.
+          Package-manager metadata retains the dependency package version; use xray version to check the actual core.
+          A later package-manager upgrade may replace this binary; rerun this installer to restore the bundled core.
+
           OpenWrt / ImmortalWrt: ${OPENWRT_VERSION}
 
           Dependencies:
@@ -228,7 +301,7 @@ jobs:
           - aarch64_generic: kenzok8/small ${KENZOK8_TAG_aarch64_generic}
           EOF
           if [ -f downloads/xray-sources.txt ]; then
-            printf '\nXray core fallback sources:\n' >> release_notes.md
+            printf '\nXray dependency package fallback sources (binary replaced with official stable):\n' >> release_notes.md
             cat downloads/xray-sources.txt >> release_notes.md
           fi
 
@@ -236,7 +309,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
-          name: PassWall ${{ env.PASSWALL_TAG }} - OpenWrt ${{ env.OPENWRT_VERSION }}
+          name: PassWall ${{ env.PASSWALL_TAG }} - OpenWrt ${{ env.OPENWRT_VERSION }} - Xray ${{ env.XRAY_TAG }}
           target_commitish: ${{ github.sha }}
           body_path: release_notes.md
           files: passwall_*.run
